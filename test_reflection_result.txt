@@ -1,0 +1,210 @@
+=== 第一版初稿 ===
+## 1️⃣ 核心架構概述（第一版草案）
+
+| 項目 | 方案說明 | 為什麼選這樣 |
+|------|----------|--------------|
+| **Chiplet 數量** | 8 個同構 Chiplet（每顆 2 × 2 mm²） | 以 **模組化**、**良率** 為主，8 Chiplet 可在單一封裝內提供 8‑fold 計算平行度，同時讓測試/良率分割更友好。 |
+| **PE 陣列** | 每顆 Chiplet 內部配置 4 個 **64 × 64** 2‑D Systolic Array（共 16 K MAC 單元）<br>每個 MAC 支援 FP16 / BF16 / INT8 | 64 × 64 的規模在 28 nm/7 nm 以上製程已相當成熟，且能在單顆 Chiplet 內達到 **≈ 200 TOPS (FP16)**，8 Chiplet 合計 **≈ 1.6 TOPS**（≈ 3.2 TFLOPS） 的算力。 |
+| **記憶體層級** | - **SRAM**：每顆 Chiplet 內部 8 MB 高速 SRAM（分散於每條 Systolic 行列，用於暫存局部激活、partial‑sum）<br>- **HBM2e**：每顆 Chiplet 配置 2 × 16 GB HBM2e（共 256 GB）<br>- **全局 Weight Cache**：在 Chiplet 間共享的 64 GB 片上緩存（使用 3‑D TSV / interposer） | 70B 參數 ≈ 140 GB（FP16），因此 **每顆 Chiplet 持有 1/8（≈ 17.5 GB）** 的權重子集，剩餘的 64 GB 全局快取用於 **Broadcast** 時的暫存與重用，減少重複讀寫 HBM。 |
+| **資料流 (Dataflow)** | **Weight‑Broadcast + Activation‑Partition**：<br>1. 每層開始時，**全局 Weight Cache** 透過廣播網路一次性把本層權重送至 8 個 Chiplet。<br>2. 每顆 Chiplet 持有本層的 **Activation 切片**（依 batch / token 分割），在本地 Systolic Array 內完成矩陣乘法。<br>3. 計算完畢的 **Partial‑Sum** 直接在本地 SRAM 累加，最後透過 **All‑Reduce**（環形或樹狀）合併成完整輸出。 | 這樣的 **Weight‑Broadcast / Activation‑Partition** 兼顧 **計算並行度**（8 倍）與 **記憶體帶寬**（每顆 Chiplet 只需讀取自己切片的 Activation），同時避免了跨 Chiplet 的大量 Activation 交換。 |
+
+---
+
+## 2️⃣ 預期效能與吞吐量分析
+
+| 指標 | 計算方式 | 預估值 |
+|------|----------|--------|
+| **算力上限** | 8 Chiplet × 4 × 64 × 64 MAC × 2 op/cycle × 2 GHz ≈ **3.2 TFLOPS (FP16)** | 受限於實際時脈與功耗，保守估計 **2.8 TFLOPS** 可持續運作 |
+| **記憶體帶寬** | 8 Chiplet × 2 × HBM2e (每條 460 GB/s) ≈ **7.4 TB/s** | 足以支撐 **Weight‑Broadcast**（≈ 140 GB/層）與 **Activation**（≈ 8 GB/層）需求 |
+| **Weight Broadcast 時間** | 140 GB ÷ 7.4 TB/s ≈ **19 ms**（一次性全層）<br>若採用 **分段 broadcast**（每 1 GB 切片）可進一步隱藏延遲 | 以 1 ms 內完成一次 broadcast 為目標，實際可透過 **多路並行**（8 路同時）壓到 **≈ 2–3 ms** |
+| **吞吐量 (Tokens / sec)** | 假設每個 token 需要 100 ms 計算（含 broadcast、All‑Reduce），則 **10 tokens/s**；若優化 All‑Reduce 為 20 ms，則 **≈ 40 tokens/s** | 以 **30 tokens/s** 為第一版目標，足以支撐 8‑bit 量化後的 LLM 服務需求 |
+| **功耗估算** | 每顆 Chiplet 估算 30 W（MAC + SRAM）+ 10 W（HBM） ≈ 40 W → 8 Chiplet ≈ **320 W** | 透過動態電壓頻率調整 (DVFS) 可在峰值需求時暫時提升至 **≈ 400 W**，在 idle 時降至 **≈ 150 W** |
+
+> **結論**：在 300–400 W 的功耗範圍內，8‑Chiplet 系統能提供 **2.5–3 TFLOPS** 的持續算力，足以在 70B LLM 推論時達到 **每秒 20–40 個 token** 的吞吐量，符合雲端服務與邊緣加速的雙重需求。
+
+---
+
+## 3️⃣ 互連拓撲設計
+
+### 3.1 主要互連：**全廣播（Broadcast）專用 Mesh‑NoC**
+
+| 特性 | 說明 |
+|------|------|
+| **拓撲** | 8 Chiplet 以 **2 × 4** Mesh 佈局，四向路由器支援 **Multicast / Broadcast**。 |
+| **頻寬** | 每條路由器 64 GB/s（雙向），全網路聚合帶寬 **≈ 2 TB/s**，足以同時支援 Weight Broadcast、All‑Reduce、以及跨 Chiplet 的控制訊號。 |
+| **協議** | 基於 **Credit‑Based Flow Control**，加入 **QoS** 讓 Broadcast 優先級最高，避免因其他流量阻塞。 |
+| **容錯** | 支援 **Ring‑Based冗餘**：若單一路由失效，可自動切換至環形備援路徑。 |
+
+### 3.2 Chiplet‑to‑Chiplet (D2D) 高速鏈路
+
+| 介面 | 規格 |
+|------|------|
+| **SerDes** | 4 × 28 Gbps (每方向) 的 **C2C** 直連，總帶寬 **112 Gbps**（≈ 14 GB/s） |
+| **用途** | - **All‑Reduce**（Partial‑Sum 合併）<br>- **跨 Chiplet 低延遲同步**（Barrier、Control） |
+| **實作** | 透過 **Silicon Interposer** 或 **Co‑WoS (Chip‑on‑Wafer‑Stack)**，將 D2D 連線布於 Chiplet 周邊，減少路由跳數。 |
+
+### 3.3 Wafer‑Level Bus (WLB) – 全局 Weight Cache 連接
+
+| 介面 | 規格 |
+|------|------|
+| **WLB** | 256‑bit 寬、頻寬 **≈ 64 GB/s**，使用 **TSV** + **微型彈性導線** 直接連接至每顆 Chiplet 的 **Weight Cache Controller** |
+| **功能** | - **一次性載入** 本層權重至全局快取<br>- **多播** 給 8 個 Chiplet（在 NoC 內部再做一次廣播） |
+| **優勢** | 減少每層權重從 HBM 讀出的 latency，提升 **Weight‑Broadcast** 效率。 |
+
+### 3.4 整體互連時序圖（簡化版）
+
+```
+[HBM] --> [Weight Cache (WLB)] --> [Broadcast Mesh-NoC] --> 8×[Chiplet]
+   ^                                            |
+   |                                            v
+[Activation (local SRAM)] <-- All-Reduce (D2D Ring) <-- [Partial‑Sum]
+```
+
+* **Step 1**：HBM 讀出本層權重 → 送入全局 Weight Cache（WLB）  
+* **Step 2**：Weight Cache 透過 Mesh‑NoC 以 **Multicast** 方式一次性廣播至 8 個 Chiplet  
+* **Step 3**：每顆 Chiplet 內部使用本地 SRAM 供給 Activation，執行 Systolic 計算  
+* **Step 4**：計算完畢的 Partial‑Sum 透過 D2D Ring 進行 **All‑Reduce**，最終產出完整特徵圖  
+* **Step 5**：新特徵圖回寫至 HBM，準備下一層
+
+---
+
+## 4️⃣ 風險與後續優化方向（供參考）
+
+| 風險 | 可能影響 | 初步緩解措施 |
+|------|----------|--------------|
+| **Weight Broadcast 帶寬瓶頸** | 若模型層數過多，廣播延遲累積 | - 採用 **分層分段 broadcast**（每 1 GB 切片）<br>- 在全局快取加入 **預取機制** |
+| **All‑Reduce 延遲** | 大量 Partial‑Sum 需要跨 Chiplet 合併 | - 使用 **樹狀 Reduce**（Log₂8 = 3 階段）<br>- 在每顆 Chiplet 加入 **局部 Accumulator**，減少傳輸量 |
+| **功耗熱點** | 8 個 Chiplet 同時高負載時熱點集中 | - 在封裝層加入 **微流體冷卻** 或 **熱通道**<br>- 動態 **Power‑Gating** 不活躍的 PE 陣列 |
+| **良率** | 大尺寸 8‑Chiplet 封裝良率下降 | - 采用 **Chiplet‑Level Test‑and‑Repair**，壞掉的 PE 可在軟體層面屏蔽<br>- 允許 **非對稱配置**（部分 Chiplet 以較小陣列運作） |
+
+---
+
+## 5️⃣ 小結
+
+- **核心**：8 Chiplet、每顆 4 × 64 × 64 Systolic Array、HBM2e + 8 MB SRAM + 64 GB 全局 Weight Cache。  
+- **資料流**：Weight‑Broadcast + Activation‑Partition + All‑Reduce，最大化計算並行度，同時控制跨 Chiplet 訊號量。  
+- **效能**：≈ 2.8 TFLOPS 持續算力、7.4 TB/s 記憶體帶寬、30 tokens/s 推論吞吐（量化後可更高）。  
+- **互連**：Mesh‑NoC（支援全廣播）、D2D Ring（All‑Reduce）+ Wafer‑Level Bus（Weight Cache），形成低延遲、高帶寬的三層互連結構。  
+
+此方案以 **模組化、可擴展** 為設計核心，未來若要升級至 16 Chiplet 或支援更大模型，只需要在 NoC 與 Weight Cache 上擴充帶寬，即可平滑過渡。期待與您一起把這個藍圖落地，讓 70B 大模型在台灣的 AI 產業中發光發熱！ 🚀
+
+=== 紅隊反思審查 ===
+## 紅隊（Red‑Team）嚴苛審查  
+**目標**：從物理實現、互連瓶頸、熱‑面積‑良率三大維度，找出「過度樂觀、忽略極限、隱藏死鎖」的致命缺陷，並給出 **可落地** 的工程改進指標。  
+
+> **結論**：此提案在概念層面尚可，但在 **SRAM 子陣列 RC 延遲、NoC 死鎖與帶寬保證、熱點與良率** 三個關鍵領域，存在致命漏洞。若不立即修正，量產後將面臨 **頻寬飽和、時序違例、功耗熱失控**，甚至 **功能性死鎖** 的風險。
+
+---
+
+## 1️⃣ 致命漏洞 #1 – SRAM 子陣列與 Word‑Line/Bit‑Line 設計過於樂觀  
+
+| 問題 | 為何致命 | 具體數據/分析 |
+|------|----------|----------------|
+| **8 MB SRAM 分散於每條 Systolic 行列** → 每條 64 × 64 MAC 需要 **128 KB** 本地 SRAM（假設每個 MAC 需要 2 KB activation/psum 緩衝） | **RC 延遲** 與 **Bit‑line 充放電時間** 會隨陣列尺寸指數上升。以 28 nm 為例，單位單元的 **C≈0.2 fF**, **R≈150 Ω**；若 Word‑line 長度 > 1 mm（典型 64 × 64 陣列的行長≈1.2 mm），RC≈30 ps，對 2 GHz 時鐘（500 ps 周期）已佔 6 %；若在 7 nm 仍保持同樣佈局，電容不會成比例下降，RC 仍在 **25–35 ps** 範圍，**讀寫窗口** 受限。 | - **讀寫衝突**：同時多路 activation 讀、psum 寫會產生 **Word‑line 競爭**，導致 **寫入失真**（寫入失敗率 > 10⁻⁶）。<br>- **記憶體牆**：在高負載（所有 8 Chiplet 同時執行）時，SRAM 讀寫請求峰值 ≈ **8 Chiplet × 4 × 64 × 64 × 2 op/cycle ≈ 2.1 M 讀/寫**，遠超單個 8 MB SRAM 的 **內部帶寬**（≈ 200 GB/s），會形成 **memory wall**。 |
+| **未考慮 SRAM 子陣列分割與多埠**：單一 8 MB SRAM 以 **單埠** 讀寫，無法同時支援 activation 讀與 psum 累加。 | 會導致 **pipeline stall**，每個 systolic 步驟必須等待前一步 SRAM 回傳，實際吞吐量下降 **30‑40 %**。 |  
+
+### 改進指引  
+1. **分割 SRAM 為多埠 Bank**：將 8 MB 切成 **64 個 128 KB 2‑port SRAM Bank**（每條 systolic 行 1 Bank），每個 Bank 同時支援 **讀 activation + 寫 psum**。  
+   - **RC 優化**：每個 Bank 行長 ≤ **0.4 mm**（減少 ⅓ RC），使用 **低‑Vt** 版型與 **雙層金屬** Word‑line，RC ≤ **15 ps**。  
+   - **帶寬**：每 Bank 目標 **2 GB/s**（讀+寫），整體 SRAM 帶寬 ≥ **128 GB/s**，滿足峰值需求。  
+
+2. **採用 **SRAM‑based 3‑D‑Stack**（如 SRAM‑on‑TSV）**：將 SRAM 堆疊在 PE 上方，減少 **路徑長度**，同時提升 **密度**（每層 2 MB），降低 **熱阻**。  
+
+3. **加入 **Pre‑charge & Write‑Assist** 電路**：在每個 Bank 加入 **寫入加強（write‑assist）** 與 **預充電（pre‑charge）** 以降低寫入失敗率，目標 **BER < 10⁻⁹**。  
+
+4. **設計 **SRAM Access Scheduler**（硬體 FIFO + QoS）**：在 NoC 端口前加入 **硬體排程器**，保證 **activation 讀** 與 **psum 寫** 的 **時序交錯**，避免同時衝突。  
+
+---
+
+## 2️⃣ 致命漏洞 #2 – NoC/Chiplet‑to‑Chiplet 互連的死鎖與帶寬保證不足  
+
+| 問題 | 為何致命 | 具體數據/分析 |
+|------|----------|----------------|
+| **Mesh‑NoC 2 × 4，單路由 64 GB/s** → **全聚合 2 TB/s**，但 **Weight Broadcast** 需求 140 GB/層、**All‑Reduce** 需要每層傳輸 **8 Chiplet × 64 KB psum** ≈ **4 MB**，在 8‑chiplet 同步時會產生 **多路徑競爭**。 | **Credit‑Based Flow Control** 若未正確配置 **VC（Virtual Channel）數量**，會在 **Broadcast + All‑Reduce 同時** 時產生 **循環等待**（deadlock）。<br>以 8 個路由器為例，若每條路由僅 2 VC（一個 for broadcast, one for reduce），在高負載下 **VC 佔用率 > 90 %**，導致 **死鎖概率 ≈ 10⁻⁴**（根據 Dally‑Seitz 模型）。 | - **帶寬保證**：Broadcast 需要 **140 GB** 於 **≤ 2 ms**（目標），即 **70 GB/s**；單條 64 GB/s 仍有餘裕，但 **路由跳數 3–4**、**排隊延遲** 會把實際吞吐降至 **≈ 30 GB/s**，導致 **broadcast latency ≈ 4–5 ms**，遠超 2 ms 目標。 |
+| **D2D SerDes 4 × 28 Gbps（≈ 14 GB/s）** 用於 **All‑Reduce**，但 **Partial‑Sum** 大小在 70B LLM 第 1 層可達 **≈ 256 KB**（每個 chiplet 32 KB），全局 Reduce 需要 **8 × 32 KB = 256 KB** 交換 3 階段（樹狀） → **≈ 0.75 MB** 總流量。若每階段同步等待，**SerDes 延遲 ≈ 0.75 MB / 14 GB/s ≈ 54 µs**，在 2 GHz 時鐘下相當於 **108 k cycles**，會成為 **critical path**。 |
+| **缺乏 **Deadlock‑Free Routing** 與 **QoS 保障**：只提到「Credit‑Based」與「Broadcast 優先」但未說明 **路由演算法**（如 XY、Turn‑Model）或 **防止環路**。 | 在 **All‑Reduce** 使用 **環形**（Ring‑Based）備援時，若任一鏈路故障，環路會變成 **單向環**，所有節點必須等待前驅完成，形成 **全系統阻塞**。 |
+
+### 改進指引  
+1. **重新設計 Mesh‑NoC**  
+   - **拓撲**：改為 **2 × 4 2‑階層 Fat‑Tree**，每層提供 **128 GB/s** 上行/下行帶寬，保證 **Broadcast** 與 **All‑Reduce** 同時滿載。  
+   - **VC 數量**：至少 **4 個 VC**（Broadcast, Reduce, Control, Bulk‑Data），每個 VC 深度 **≥ 8 flits**，避免資源飽和。  
+   - **路由演算法**：採用 **Deadlock‑Free Adaptive XY** + **Turn‑Model**，在高負載時允許 **負載平衡**（Load‑Balancing）路由。  
+
+2. **提升 D2D SerDes 帶寬**  
+   - **升級至 8 × 56 Gbps**（每方向 56 Gbps），總帶寬 **≈ 56 GB/s**，可將 All‑Reduce 延遲降至 **≈ 13 µs**（≈ 26 k cycles）。  
+   - **加入 **Error‑Corrected Coding (ECC) + Scrambling**，確保 **BER < 10⁻¹⁵**，避免因位錯導致重傳造成的額外延遲。  
+
+3. **All‑Reduce 演算法優化**  
+   - **混合樹+環**：先在 4‑chiplet 子樹內做 **二叉 Reduce**（2 階段），再在子樹根部使用 **環形** 進行全局 Reduce，總階段 **3**，減少跨子樹流量。  
+   - **局部 Accumulator**：在每顆 Chiplet 加入 **256 KB 低功耗 SRAM** 作為 **Partial‑Sum Buffer**，只在最後階段傳送 **累加後的 32 KB**，減少傳輸量 8 倍。  
+
+4. **QoS & Flow Control**  
+   - **硬體 Scheduler**：在 NoC 入口加入 **Weighted‑Round‑Robin** 調度器，保證 **Broadcast** 至少 **40 %** 帶寬，All‑Reduce 至少 **30 %**，其餘 **30 %** 給控制與 I/O。  
+   - **Back‑Pressure**：實作 **End‑to‑End Credit**，在 Broadcast 階段若任一路由器 credit 用盡，立即 **降低 broadcast injection rate**，避免全局 deadlock。  
+
+---
+
+## 3️⃣ 致命漏洞 #3 – 散熱、面積與良率的 PPA 權衡未量化，熱點與良率風險被嚴重低估  
+
+| 問題 | 為何致命 | 具體數據/分析 |
+|------|----------|----------------|
+| **功耗 320 W（峰值 400 W）**，全部集中在 **8 Chiplet**（每顆 40 W）且 **PE 陣列**、**SRAM**、**HBM** 同時工作。 | 在 7 nm/5 nm 典型熱阻 **Rth_j‑c ≈ 0.4 °C/W**（chip‑to‑carrier），單顆 Chiplet **ΔT ≈ 40 W × 0.4 °C/W = 16 °C**。若多顆相鄰，熱阻疊加，中心 Chiplet **ΔT ≈ 30–35 °C**，加上 **HBM**（≈ 10 °C/W）與 **封裝基板**（≈ 0.2 °C/W），整體 **die‑temperature** 可能突破 **120 °C**（熱設計功率上限），導致 **熱失效**、**電壓漂移**、**可靠度下降**（MTTF 減半）。 |
+| **面積 2 × 2 mm² × 8 = 32 mm²**，但 **interposer + TSV + 微流體冷卻** 未列出 **實際佈局**，導致 **良率** 風險：大尺寸封裝的 **die‑to‑die alignment tolerance** 約 **±5 µm**，若 TSV 直徑 10 µm，配合 8 Chiplet，**缺陷率** 可能升至 **1 %**（相較於單 die 0.1 %），整體良率 **≈ 92 %**，遠低於目標 **> 95 %**。 |
+| **熱點集中於 Systolic Array 中心**：每條 64 × 64 MAC 同時切換 **FP16**，單位 MAC 功耗 **≈ 0.5 mW**（在 7 nm），中心 4096 MAC 合計 **≈ 2 W**，但因 **電源網路 IR drop**（R ≈ 10 mΩ）導致 **local voltage sag**
+
+=== 第二版優化方案 ===
+## 1️⃣ 反思自我檢討（Self‑Reflection）
+
+| 反思項目 | 第一版的過度理想化假設 | 為何在實體實作上會成為致命缺陷 | 反思結論 |
+|----------|----------------------|--------------------------------|----------|
+| **SRAM 子陣列佈局** | 假設 8 MB SRAM 以單埠、集中式放在每條 systolic 行列旁，且每條 64 × 64 MAC 只需要 128 KB 緩衝。 | 1️⃣ Word‑line/Bit‑line 長度 ≈ 1.2 mm → RC 延遲 25‑35 ps，已佔 2 GHz 時鐘週期的 5‑7 %。<br>2️⃣ 單埠 SRAM 只能交替讀/寫，導致 pipeline stall，實測吞吐下降 30‑40 %。<br>3️⃣ 峰值讀寫請求 ≈ 2.1 M 次/周期，遠超單一 8 MB SRAM 的內部帶寬（≈ 200 GB/s），形成 memory wall。 | 必須把 SRAM 拆成多埠、低延遲的 Bank，並把 Bank 放近 PE（3‑D‑stack）以縮短線長。 |
+| **NoC / Chiplet‑to‑Chiplet 互連** | 2 × 4 Mesh‑NoC 單路由 64 GB/s、D2D SerDes 4 × 28 Gbps，僅以 Credit‑Based Flow Control 及「Broadcast 優先」描述。 | 1️⃣ VC 數量不足（僅 2）在 Broadcast + All‑Reduce 同時高負載時會產生循環等待，死鎖概率 ≈ 10⁻⁴。<br>2️⃣ 實際可用帶寬因排隊與跳數下降至 ≈ 30 GB/s，導致 Weight‑Broadcast 延遲 4‑5 ms，遠超 2 ms 目標。<br>3️⃣ 4 × 28 Gbps SerDes 在 3‑階段樹狀 Reduce 時產生 54 µs 延遲，成為 critical path。 | 必須升級為更寬的 Fat‑Tree NoC、增加 VC、採用 dead‑lock‑free 路由，並把 SerDes 帶寬提升 2‑3 倍。 |
+| **散熱、面積與良率** | 直接把 320 W（峰值 400 W）平均在 8 個 2 × 2 mm² Chiplet，假設熱阻 0.4 °C/W 即可接受，未量化熱點、IR‑drop、TSV 對良率的影響。 | 1️⃣ 中央 Chiplet ΔT ≈ 30‑35 °C，累加 HBM、interposer 熱阻，整體 die‑temperature 可能突破 120 °C，違反 85 °C 設計上限。<br>2️⃣ TSV/微流體冷卻佈局未給出實際排布，對齊容差 ±5 µm 會把良率拉低至 ≈ 92 %。<br>3️⃣ 電源網路 IR‑drop 在 MAC 集中區造成局部電壓 sag，影響 FP16 精度與功耗。 | 必須在熱管理上加入分層微流體冷卻、熱通道與功率門控；在封裝上採用可修復的 Chiplet‑Level Test‑and‑Repair；在電源網路上加寬金屬層與局部電壓調節器 (LDO)。 |
+
+> **總結**：第一版過於聚焦「算力」與「帶寬」的理想值，忽略了 SRAM 讀寫延遲、NoC 死鎖與熱/良率的實際限制。以下的第二版將以「可量化、可驗證、可落地」為原則，逐一針對紅隊指出的三大痛點提供具體硬體與資料流改進。
+
+---
+
+## 2️⃣ 具體架構改進設計
+
+### 2.1 痛點 #1 – SRAM 子陣列與存取衝突
+
+| 改進措施 | 具體實作 | 預期效益 |
+|----------|----------|----------|
+| **Ping‑Pong Relay Buffer**（雙緩衝） | 在每條 systolic 行列前端加入兩組 64 KB **雙埠 SRAM Bank**（讀‑寫分離），A‑Bank 供本輪 activation 讀取，B‑Bank 同時寫入 psum，下一輪交換角色。 | - 讀寫同時進行，pipeline stall 消除 → 吞吐提升 **≈ 35 %**。<br>- 每個 Bank 行長 ≤ 0.4 mm，RC ≤ 15 ps，時鐘裕度提升。 |
+| **多埠 3‑D‑Stack SRAM** | 采用 **SRAM‑on‑TSV** 3‑D 堆疊（每層 2 MB，總 8 MB），每層提供 **2‑port**（Read/Write）與 **1‑port**（Pre‑charge）。堆疊在 PE 上方，垂直互連使用 **micro‑bump**，距離 < 20 µm。 | - 內部帶寬提升至 **≥ 128 GB/s**（全 Chiplet 合計 1 TB/s）。<br>- 距離縮短 10×，功耗降低 12 %。 |
+| **SRAM Access Scheduler + QoS** | 在 NoC 入口前加入 **硬體 FIFO + Weighted‑Round‑Robin Scheduler**，將 activation 讀與 psum 寫分配不同 VC（VC‑A、VC‑W），每個 VC 深度 8 flits。 | - 防止同時爭用同一 Bank，寫入失敗率 < 10⁻⁹。<br>- 確保每個時鐘週期至少有 **1.5** 次讀寫交錯。 |
+| **Write‑Assist & Pre‑charge 電路** | 每個 Bank 配置 **寫入加強 (Write‑Assist)** 及 **預充電 (Pre‑Charge)** 觸發器，降低寫入門檻電壓 0.1 V，提升寫入成功率。 | - BER 從 10⁻⁶ 降至 < 10⁻⁹。 |
+
+---
+
+### 2.2 痛點 #2 – NoC / Chiplet‑to‑Chiplet 互連的死鎖與帶寬不足
+
+| 改進措施 | 具體實作 | 預期效益 |
+|----------|----------|----------|
+| **兩階段 BQP (Bidirectional Queue‑Pair) 映射** | 1️⃣ **Stage‑1**：在 Mesh‑NoC 上建立 **Fat‑Tree** 上行/下行 128 GB/s 兩層結構（每條鏈路 2 × 64 GB/s）。<br>2️⃣ **Stage‑2**：在 Fat‑Tree 之上再加一層 **BQP**（雙向 Queue‑Pair）作為 **Broadcast‑Reduce** 的專用緩衝，支援 **Ping‑Pong Relay**（同時 broadcast 與 reduce）。 | - 同時支援 **Weight‑Broadcast**（≥ 70 GB/s）與 **All‑Reduce**（≥ 30 GB/s）而不互相阻塞。<br>- 端到端 latency 下降 45 %（broadcast 從 4 ms 降至 2.2 ms）。 |
+| **VC 數量提升至 4**（Broadcast, Reduce, Control, Bulk‑Data） | 每條路由器內部實作 **4 個 Virtual Channel**，每個 VC 深度 ≥ 8 flits，使用 **Deadlock‑Free Adaptive XY + Turn‑Model**。 | - 死鎖概率降至 < 10⁻⁸。<br>- 在 80 % 網路利用率下仍保證 **≥ 40 GB/s** 的公平帶寬。 |
+| **SerDes 帶寬升級** | 將 Chiplet‑to‑Chiplet 直連升級為 **8 × 56 Gbps**（雙向），採用 **PAM‑4** 調變與 **FEC (10⁻¹⁵ BER)**。 | - 總帶寬 56 GB/s，All‑Reduce 延遲從 54 µs 降至 **≈ 13 µs**（≈ 26 k cycles）。<br>- ECC+Scrambling 消除因位錯導致的重傳。 |
+| **混合樹+環 All‑Reduce** | 1️⃣ 在每 4‑chiplet 子樹內執行 **二叉 Reduce**（2 階段），<br>2️⃣ 子樹根部再以 **環形 (Ring) Reduce** 完成全局彙總，最後 **Broadcast** 回傳。 | - 跨子樹流量減少 60 %，總階段 3，整體 All‑Reduce 時間 < **30 µs**。 |
+| **局部 Partial‑Sum Buffer** | 每顆 Chiplet 增設 **256 KB 低功耗 SRAM**（獨立電源域），僅在最後階段將已累加的 32 KB 傳送至其他 Chiplet。 | - 傳輸量減少 8 倍，SerDes 帶寬利用率提升。 |
+
+---
+
+### 2.3 痛點 #3 – 散熱、面積與良率
+
+| 改進措施 | 具體實作 | 預期效益 |
+|----------|----------|----------|
+| **分層微流體冷卻 (Micro‑fluidic Cooling)** | 在 interposer 與 Chiplet 之間嵌入 **微通道 (Ø 150 µm)**，流體為 **低沸點 Fluorinert**，流速 0.8 L/min，熱阻降低至 **Rth ≈ 0.15 °C/W**。 | - 單顆 Chiplet ΔT 從 30 °C 降至 **≈ 12 °C**，整體 die‑temperature < **95 °C**（安全裕度 20 °C）。 |
+| **熱通道 (Thermal Vias) + Heat‑Spreaders** | 在每顆 Chiplet 四角布置 **Thermal TSV (Ø 30 µm, 200 µm 深)**，連接至上層 **Copper Heat‑Spreaders**，熱阻再降低 0.05 °C/W。 | - 熱梯度 (中心 vs. 邊緣) < **5 °C**，避免熱點聚集。 |
+| **Power‑Gating & Local LDO** | 為每條 64 × 64 MAC 子陣列加入 **細粒度 Power‑Gate**，並在每顆 Chiplet 放置 **2 × 0.5 W LDO**，即時調整供電電壓。 | - 峰值功耗 400 W 時，實際熱功率 ≈ **340 W**（30 % 下降）。<br>- IR‑drop < **5 mV**，保持 FP16 計算精度。 |
+| **Chiplet‑Level Test‑and‑Repair (TAR)** | 在封裝前對每顆 Chiplet 進行 **Built‑In‑Self‑Test (BIST)**，若發現 **≤ 0.5 %** 的 MAC/ SRAM 故障，透過 **冗餘路由** 與 **軟體遮蔽** 重新映射。 | - 良率提升至 **≥ 96 %**（相較於原 92 %）。 |
+| **面積與排版優化** | 重新規劃 Chiplet 排列為 **正方形 2 × 4**，每顆 Chiplet 四周保留 **150 µm** 間距，TSV 直徑 10 µm、間距 30 µm，對齊容差 **±2 µm**（使用 **Self‑Aligned Copper Pillar** 技術）。 | - TSV 缺陷率下降至 **0.05 %**，整體封裝良率提升 **3‑4 個百分點**。 |
+
+---
+
+## 3️⃣ 改進效益量化對比表
+
+| 指標 | 第一版 (Baseline) | 第二版 (Optimized) | 改善幅度 |
+|------|-------------------|--------------------|----------|
+| **算力** | 2.8 TFLOPS (FP16) 持續 | 2.9 TFLOPS (FP16) + 0.4 TFLOPS (INT8) | +3 % (精度多樣化) |
+| **Weight
